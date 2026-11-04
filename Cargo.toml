@@ -7,3 +7,19 @@ license = "MIT"
 authors = ["creator521314"]
 
 [dependencies]
+# CLI 解析：多 flag + 变长位置参数 + 自动用法说明，手写解析错误处理成本高于成熟依赖
+clap = "4"
+# 配置文件反序列化
+serde = { version = "1", features = ["derive"] }
+# ollama API 与 LLM 输出解析
+serde_json = "1"
+# config.toml 解析
+toml = "0.8"
+# XDG 配置目录解析（手写无法正确处理 XDG_CONFIG_HOME 覆盖）
+dirs = "5"
+# 阻塞式 HTTP 客户端：不拖 tokio 运行时，保进程冷启动 < 20ms（设计决策 1）
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
