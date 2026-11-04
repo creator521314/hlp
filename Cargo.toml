@@ -1,0 +1,9 @@
+[package]
+name = "hlp"
+version = "0.1.0"
+edition = "2021"
+description = "自然语言 → shell 命令翻译器：意图进，命令出，附逐段解释"
+license = "MIT"
+authors = ["creator521314"]
+
+[dependencies]
