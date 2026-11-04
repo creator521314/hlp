@@ -57,8 +57,8 @@ pub struct Store {
     path: PathBuf,
 }
 
-/// schema（user_version = 1，设计 §2.5）
-const SCHEMA: &str = "
+/// v0.3 schema（user_version = 1）
+const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS entries (
   id            INTEGER PRIMARY KEY,
   intent_norm   TEXT NOT NULL,
@@ -70,31 +70,65 @@ CREATE TABLE IF NOT EXISTS entries (
   last_used_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_intent_norm ON entries(intent_norm);
-PRAGMA user_version = 1;
 ";
+
+/// v0.4 kb 语料表（设计 §3.2）；与历史缓存同库，`--clear` 只清 entries，
+/// 不动公共语料（决策 2）。user_version < 2 时执行，末尾置 2。
+const SCHEMA_KB: &str = "
+CREATE TABLE IF NOT EXISTS kb_pages (
+  command     TEXT NOT NULL,
+  lang        TEXT NOT NULL,
+  platform    TEXT NOT NULL,
+  description TEXT NOT NULL,
+  PRIMARY KEY (command, lang, platform)
+);
+CREATE TABLE IF NOT EXISTS kb_examples (
+  id          INTEGER PRIMARY KEY,
+  command     TEXT NOT NULL,
+  lang        TEXT NOT NULL,
+  example_cmd TEXT NOT NULL,
+  example_desc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kb_examples_cmd ON kb_examples(command, lang);
+CREATE TABLE IF NOT EXISTS kb_meta (k TEXT PRIMARY KEY, v TEXT);
+PRAGMA user_version = 2;
+";
+
+/// 打开（并在必要时迁移）同库连接。Store / Kb / kb-update 共用，
+/// 保证任何入口拿到连接时 kb_* 表都已存在。
+pub fn open_connection(path: &Path) -> Result<Connection, HlpError> {
+    let err = |reason: String| HlpError::CacheUnavailable {
+        path: path.to_path_buf(),
+        reason,
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)
+            .map_err(|e| err(format!("无法创建数据目录 {}：{e}", dir.display())))?;
+    }
+    let conn = Connection::open(path).map_err(|e| err(e.to_string()))?;
+    // WAL + busy_timeout：并发写者（daemon / cache-learn / kb-update）
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .and_then(|_| conn.busy_timeout(Duration::from_millis(5_000)))
+        .map_err(|e| err(e.to_string()))?;
+    conn.execute_batch(SCHEMA_V1).map_err(|e| err(e.to_string()))?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| err(e.to_string()))?;
+    if version < 2 {
+        conn.execute_batch(SCHEMA_KB).map_err(|e| err(e.to_string()))?;
+    }
+    // 数据只归本用户（§3.4：0600）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(conn)
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store, HlpError> {
-        let err = |reason: String| HlpError::CacheUnavailable {
-            path: path.to_path_buf(),
-            reason,
-        };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)
-                .map_err(|e| err(format!("无法创建数据目录 {}：{e}", dir.display())))?;
-        }
-        let conn = Connection::open(path).map_err(|e| err(e.to_string()))?;
-        // WAL + busy_timeout：并发写者（daemon / cache-learn）下防 database is locked
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .and_then(|_| conn.busy_timeout(Duration::from_millis(5_000)))
-            .map_err(|e| err(e.to_string()))?;
-        conn.execute_batch(SCHEMA).map_err(|e| err(e.to_string()))?;
-        // 数据只归本用户（§3.4：0600）
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        }
+        let conn = open_connection(path)?;
         Ok(Store {
             conn,
             path: path.to_path_buf(),
@@ -312,14 +346,37 @@ mod tests {
         assert_eq!(s.count().unwrap(), 1);
     }
 
-    /// user_version 标记
+    /// v0.4：schema 迁移后 user_version = 2，kb_* 表就绪
     #[test]
-    fn user_version_is_one() {
+    fn user_version_is_two_with_kb_tables() {
         let s = tmp_store("version");
         let v: i64 = s
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
+        let tables: i64 = s
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN
+                 ('kb_pages','kb_examples','kb_meta','entries')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 4);
+        // --clear 只清历史，不清 kb 语料
+        s.conn
+            .execute(
+                "INSERT INTO kb_pages VALUES ('find','en','common','search')",
+                [],
+            )
+            .unwrap();
+        s.conn.execute("DELETE FROM entries", []).unwrap();
+        let pages: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM kb_pages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pages, 1);
     }
 }

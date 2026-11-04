@@ -21,6 +21,15 @@ pub struct Config {
     /// daemon（v0.3）
     #[serde(default)]
     pub daemon: DaemonConfig,
+    /// tldr 知识库（v0.4）
+    #[serde(default)]
+    pub kb: KbConfig,
+    /// 解释模式（v0.4）
+    #[serde(default)]
+    pub explain: ExplainConfig,
+    /// TUI 卡片（v0.4）
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 impl Default for Config {
@@ -30,6 +39,9 @@ impl Default for Config {
             ollama: OllamaConfig::default(),
             cache: CacheConfig::default(),
             daemon: DaemonConfig::default(),
+            kb: KbConfig::default(),
+            explain: ExplainConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -105,6 +117,58 @@ impl Default for DaemonConfig {
     }
 }
 
+/// tldr 知识库配置（v0.4 设计 §3.1）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct KbConfig {
+    /// 第 2 层开关；关闭后 kb 层完全不触碰 DB
+    pub enabled: bool,
+    /// 命中阈值，0.0..=1.0
+    pub min_score: f64,
+    /// 空 = 官方 release 地址；可覆盖为代理/镜像（测试用 file:// 由 HLP_KB_URL 提供）
+    pub index_url: String,
+}
+
+impl Default for KbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_score: 0.6,
+            index_url: String::new(),
+        }
+    }
+}
+
+/// 解释模式配置（v0.4 设计 §3.1）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExplainConfig {
+    /// auto | zh | en
+    pub language: String,
+}
+
+impl Default for ExplainConfig {
+    fn default() -> Self {
+        Self {
+            language: "auto".to_string(),
+        }
+    }
+}
+
+/// TUI 配置（v0.4 设计 §3.1）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TuiConfig {
+    /// TUI 生成时请求的候选数，1..=8
+    pub max_candidates: usize,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { max_candidates: 3 }
+    }
+}
+
 /// 展开 `~` / `~/x` 前缀；其余原样返回；空串返回 None（由校验拒绝）。
 fn expand_tilde(p: &str) -> Option<PathBuf> {
     let home = dirs::home_dir();
@@ -173,6 +237,33 @@ impl Config {
             if d.trim().is_empty() {
                 return Err(invalid("cache.exempt_dirs 含空串条目".into()));
             }
+        }
+        // ── v0.4：[kb] / [explain] / [tui] 校验（设计 §3.1）──
+        if !self.kb.min_score.is_finite() || !(0.0..=1.0).contains(&self.kb.min_score) {
+            return Err(invalid(format!(
+                "kb.min_score 须在 0.0..=1.0，当前值：{}",
+                self.kb.min_score
+            )));
+        }
+        let idx = self.kb.index_url.trim();
+        if !idx.is_empty()
+            && !(idx.starts_with("http://") || idx.starts_with("https://") || idx.starts_with("file://"))
+        {
+            return Err(invalid(format!(
+                "kb.index_url 须为 http(s)/file URL 或留空，当前值：{idx}"
+            )));
+        }
+        if !["auto", "zh", "en"].contains(&self.explain.language.as_str()) {
+            return Err(invalid(format!(
+                "explain.language 须为 auto|zh|en，当前值：{}",
+                self.explain.language
+            )));
+        }
+        if !(1..=8).contains(&self.tui.max_candidates) {
+            return Err(invalid(format!(
+                "tui.max_candidates 须在 1..=8，当前值：{}",
+                self.tui.max_candidates
+            )));
         }
         Ok(())
     }

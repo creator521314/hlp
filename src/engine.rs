@@ -7,22 +7,22 @@ use crate::config::Config;
 use crate::daemon::{self, client};
 use crate::daemon::protocol::Source;
 use crate::error::HlpError;
+use crate::explain::Segment;
+use crate::kb::Kb;
 use crate::prompt;
 use crate::provider::GenerateRequest;
 use crate::provider::Provider;
 
-/// 编排引擎（v0.3 §2.10）：
+/// 编排引擎（v0.4 §4.1 三层链）：
 ///
 /// ```text
-/// 意图归一化 → 缓存 lookup
-///   ├─ 命中 → 单候选返回（source=cache，verbose 标注）
-///   └─ 未命中 → daemon-first：
-///         ensure_running 成功 → daemon::client::generate（stream 时接快照回调）
-///         Transient 失败（拉起失败/协议错误/断连）→ 回退 v0.1 直连 Provider
+/// 意图归一化 → 第 1 层 cache.lookup（v0.3，命中 source=cache）
+///   └─ 未命中 → 第 2 层 kb.lookup（v0.4，达阈值 source=kb，占位符原样）
+///         └─ 未命中 → 第 3 层 daemon-first LLM（v0.3 不变）
 /// ```
 ///
-/// stdout 纯净协议与退出码集保持不变；缓存故障静默降级（决策 3）、
-/// daemon 故障回退直连（决策 5）——两套基础设施都不在正确性关键路径上。
+/// stdout 纯净协议与退出码集保持不变；缓存/kb 故障静默降级（决策 3）、
+/// daemon 故障回退直连（决策 5）——基础设施都不在正确性关键路径上。
 pub struct Engine {
     cfg: Config,
     provider: Box<dyn Provider>,
@@ -30,8 +30,12 @@ pub struct Engine {
     max_candidates: usize,
     /// 缓存；打开失败时为禁用实例（no-op）
     cache: Cache,
+    /// tldr 知识库（v0.4 第 2 层）；失败为空实现
+    kb: Kb,
     /// 单元测试用 with_provider 构造时关闭 daemon 路径，避免真拉起
     use_daemon: bool,
+    /// TUI 卡片请求逐段解释（决策 8）
+    want_explanation: bool,
 }
 
 /// 引擎产出，供 output 层渲染。
@@ -47,6 +51,10 @@ pub struct EngineOutcome {
     pub source: Source,
     /// 缓存命中方式（verbose 元信息用；LLM 路径为 None）
     pub match_kind: Option<MatchKind>,
+    /// kb 命中分数（verbose 元信息用；其它路径为 None）
+    pub kb_score: Option<f64>,
+    /// 逐段解释（TUI 卡片；want_explanation=false 时为空）
+    pub segments: Vec<Segment>,
 }
 
 impl Engine {
@@ -56,14 +64,23 @@ impl Engine {
         let max_candidates = cfg.ollama.max_candidates;
         // 尽力打开：失败降级为禁用（决策 3）
         let cache = Cache::open_best_effort(&cfg);
+        // kb 层：DB 故障 / disabled 都退化为空实现，不阻断生成
+        let kb = Kb::from_config(&cfg)?;
         Ok(Engine {
             cfg,
             provider,
             model,
             max_candidates,
             cache,
+            kb,
             use_daemon: true,
+            want_explanation: false,
         })
+    }
+
+    /// TUI 卡片打开逐段解释（决策 8：生成与解释同一次 LLM 调用）。
+    pub fn set_want_explanation(&mut self, v: bool) {
+        self.want_explanation = v;
     }
 
     /// 供测试注入 mock Provider（daemon 路径关闭）。
@@ -75,19 +92,22 @@ impl Engine {
     ) -> Self {
         let cfg = Config::default();
         let cache = Cache::disabled_for_test();
+        let kb = Kb::open_at(&cfg, &std::path::PathBuf::from("/proc/hlp-test-no-db.sqlite"));
         Engine {
             cfg,
             provider,
             model,
             max_candidates,
             cache,
+            kb,
             use_daemon: false,
+            want_explanation: false,
         }
     }
 
     /// v0.1 主形态（行为契约不变）。
     pub fn run(&mut self, args: &CliArgs) -> Result<EngineOutcome, HlpError> {
-        self.run_inner(&args.intent, false, None)
+        self.run_inner(&args.intent, false, args.alt, None)
     }
 
     /// v0.3 流式形态：`on_chunk` 逐快照触发（全量替换语义）。
@@ -96,13 +116,14 @@ impl Engine {
         intent: &str,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<EngineOutcome, HlpError> {
-        self.run_inner(intent, true, Some(on_chunk))
+        self.run_inner(intent, true, false, Some(on_chunk))
     }
 
     fn run_inner(
         &mut self,
         intent: &str,
         stream: bool,
+        alt: bool,
         mut on_chunk: Option<&mut dyn FnMut(&str)>,
     ) -> Result<EngineOutcome, HlpError> {
         let start = Instant::now();
@@ -117,6 +138,29 @@ impl Engine {
                 elapsed: start.elapsed(),
                 source: Source::Cache,
                 match_kind: Some(kind),
+                kb_score: None,
+                segments: Vec::new(),
+            });
+        }
+
+        // 2. kb 层（v0.4 决策 3：达 min_score 即整体优先，不与 LLM 混排打分）。
+        //    stdout 契约不变：top1 单行、{{占位符}} 原样；--alt 时把 kb 组全部命中作为候选。
+        let hits = self.kb.lookup(intent);
+        if let Some(top) = hits.first() {
+            return Ok(EngineOutcome {
+                top1: top.command.clone(),
+                alternatives: if alt {
+                    hits.iter().skip(1).map(|h| h.command.clone()).collect()
+                } else {
+                    Vec::new()
+                },
+                provider_name: self.provider.name(),
+                model: self.model.clone(),
+                elapsed: start.elapsed(),
+                source: Source::Kb,
+                match_kind: None,
+                kb_score: Some(top.score),
+                segments: Vec::new(),
             });
         }
 
@@ -124,7 +168,8 @@ impl Engine {
         let req = GenerateRequest {
             intent: intent.to_string(),
             max_candidates: max,
-            system_prompt: prompt::build_system_prompt(max),
+            system_prompt: prompt::build_system_prompt_with(max, self.want_explanation),
+            want_explanation: self.want_explanation,
         };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -169,6 +214,8 @@ impl Engine {
             elapsed,
             source,
             match_kind: None,
+            kb_score: None,
+            segments: resp.segments,
         }
     }
 }
@@ -193,6 +240,7 @@ mod tests {
                     .iter()
                     .map(|c| Candidate { command: c.clone() })
                     .collect(),
+                segments: Vec::new(),
             })
         }
     }

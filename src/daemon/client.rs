@@ -76,12 +76,17 @@ pub fn generate(
                         raw_excerpt: "daemon 返回空候选".to_string(),
                     }));
                 }
-                let response = GenerateResponse { candidates };
+                let response = GenerateResponse { candidates, segments: Vec::new() };
                 return Ok((response, source));
             }
             Some(Event::Ok) => {
                 return Err(Failure::Transient(HlpError::DaemonStart {
                     reason: "协议错位：期待 done，收到 ok".to_string(),
+                }))
+            }
+            Some(Event::Explanation { .. }) => {
+                return Err(Failure::Transient(HlpError::DaemonStart {
+                    reason: "协议错位：期待 done，收到 explanation".to_string(),
                 }))
             }
             Some(Event::Error { kind, message }) => {
@@ -103,6 +108,44 @@ pub fn generate(
             }
         }
     }
+}
+
+/// v0.4：经 daemon v2 Explain 取解释。
+/// None = daemon 不可用/版本不匹配/执行失败 → 调用方回退直连 Provider（决策 12）。
+pub fn explain(
+    cfg: &Config,
+    command: &str,
+    lang: crate::explain::Lang,
+    offline: bool,
+) -> Result<Option<crate::explain::Explanation>, HlpError> {
+    // ping 用当前协议版本：旧 v1 daemon 会回 protocol 错误 → false → 直连
+    if !ping(cfg) {
+        return Ok(None);
+    }
+    let mut sock = match connect(cfg) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let req = Request {
+        v: PROTOCOL_VERSION,
+        op: Op::Explain {
+            command: command.to_string(),
+            lang,
+            offline,
+        },
+    };
+    if send_request(&mut sock, &req).is_err() {
+        return Ok(None);
+    }
+    Ok(match read_one_event(&mut sock) {
+        Some(Event::Explanation { segments, source }) => Some(crate::explain::Explanation {
+            segments,
+            lang,
+            source,
+        }),
+        // 任何其它应答（protocol / provider 错误、断连）→ 回退直连
+        _ => None,
+    })
 }
 
 /// 经 daemon 学习回流（daemon 不在时调用方直写 DB）。

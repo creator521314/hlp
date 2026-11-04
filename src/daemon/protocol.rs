@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 客户端 → daemon，单行 JSON。`op` 以内部标签平铺到顶层（§3.2 帧样例）。
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,6 +39,12 @@ pub enum Op {
     },
     Clear,
     Ping,
+    /// v0.4：解释模式（daemon 侧一次性 LLM + kb 本地标注兜底）
+    Explain {
+        command: String,
+        lang: crate::explain::Lang,
+        offline: bool,
+    },
 }
 
 /// daemon → 客户端，每行一个。
@@ -54,6 +60,11 @@ pub enum Event {
     },
     /// Learn / Clear / Ping 的应答
     Ok,
+    /// v0.4：Explain 的终结事件
+    Explanation {
+        segments: Vec<crate::explain::Segment>,
+        source: crate::explain::ExplainSource,
+    },
     Error { kind: ErrorKind, message: String },
 }
 
@@ -62,6 +73,7 @@ pub enum Event {
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     Cache,
+    Kb,
     Llm,
 }
 
@@ -69,6 +81,7 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Source::Cache => "cache",
+            Source::Kb => "kb",
             Source::Llm => "llm",
         }
     }
@@ -92,7 +105,7 @@ mod tests {
     #[test]
     fn request_generate_wire_format() {
         let req = Request {
-            v: 1,
+            v: PROTOCOL_VERSION,
             op: Op::Generate {
                 intent: "列出大文件".to_string(),
                 max_candidates: 3,
@@ -103,25 +116,25 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(
             json,
-            r#"{"v":1,"op":"generate","intent":"列出大文件","max_candidates":3,"cwd":"/home/x","stream":true}"#
+            r#"{"v":2,"op":"generate","intent":"列出大文件","max_candidates":3,"cwd":"/home/x","stream":true}"#
         );
         // 反向解析
         let back: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Request { v: 1, op: Op::Generate { stream: true, .. } }));
+        assert!(matches!(back, Request { v: 2, op: Op::Generate { stream: true, .. } }));
     }
 
     #[test]
     fn unit_ops_wire_format() {
-        let ping = serde_json::to_string(&Request { v: 1, op: Op::Ping }).unwrap();
-        assert_eq!(ping, r#"{"v":1,"op":"ping"}"#);
+        let ping = serde_json::to_string(&Request { v: PROTOCOL_VERSION, op: Op::Ping }).unwrap();
+        assert_eq!(ping, r#"{"v":2,"op":"ping"}"#);
         let back: Request = serde_json::from_str(&ping).unwrap();
         assert!(matches!(back.op, Op::Ping));
 
-        let clear = serde_json::to_string(&Request { v: 1, op: Op::Clear }).unwrap();
-        assert_eq!(clear, r#"{"v":1,"op":"clear"}"#);
+        let clear = serde_json::to_string(&Request { v: PROTOCOL_VERSION, op: Op::Clear }).unwrap();
+        assert_eq!(clear, r#"{"v":2,"op":"clear"}"#);
 
         let learn = serde_json::to_string(&Request {
-            v: 1,
+            v: PROTOCOL_VERSION,
             op: Op::Learn {
                 intent: "i".to_string(),
                 command: "c".to_string(),
@@ -155,6 +168,47 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(err, Event::Error { kind: ErrorKind::ProviderUnreachable, .. }));
+    }
+
+    /// T-U-66：协议 v2 Explain / Explanation 往返；v1 请求解析后将被 server 拒绝
+    #[test]
+    fn tu66_explain_wire_roundtrip() {
+        use crate::explain::{lang::Lang, ExplainSource, Segment};
+        let req = Request {
+            v: PROTOCOL_VERSION,
+            op: Op::Explain {
+                command: "find . | sort".to_string(),
+                lang: Lang::Zh,
+                offline: true,
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":2,"op":"explain","command":"find . | sort","lang":"zh","offline":true}"#
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.op, Op::Explain { offline: true, .. }));
+
+        let ev = Event::Explanation {
+            segments: vec![Segment {
+                cmd: "find .".to_string(),
+                note: "查找".to_string(),
+            }],
+            source: ExplainSource::Mixed,
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            line,
+            r#"{"type":"explanation","segments":[{"cmd":"find .","note":"查找"}],"source":"mixed"}"#
+        );
+        let back: Event = serde_json::from_str(&line).unwrap();
+        assert!(matches!(back, Event::Explanation { .. }));
+
+        // v1 请求仍可解析（版本检查在语义层，server 会回 protocol 错误）
+        let old: Request = serde_json::from_str(r#"{"v":1,"op":"ping"}"#).unwrap();
+        assert_eq!(old.v, 1);
+        assert_ne!(old.v, PROTOCOL_VERSION);
     }
 
     /// 版本不匹配的请求仍可解析（版本检查在语义层做，不依赖解析失败）

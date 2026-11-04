@@ -58,7 +58,7 @@ pub fn serve(cfg: &Config) -> Result<ServeResult, HlpError> {
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                handle_connection(stream, &mut cache, provider.as_ref());
+                handle_connection(stream, cfg, &mut cache, provider.as_ref());
                 last_active = Instant::now();
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -99,6 +99,7 @@ fn bind_or_yield(cfg: &Config, path: &Path) -> Result<Option<UnixListener>, HlpE
 /// 单连接处理失败不退出主循环（§2.2 失败语义）。
 fn handle_connection(
     stream: UnixStream,
+    cfg: &Config,
     cache: &mut Cache,
     provider: &dyn Provider,
 ) {
@@ -140,6 +141,31 @@ fn handle_connection(
         Op::Ping => {
             let _ = send_event(&mut writer, &Event::Ok);
         }
+        Op::Explain {
+            command,
+            lang,
+            offline,
+        } => {
+            // 服务端复用与直连相同的合成逻辑（本地标注 + 一次 LLM），不经 socket 递归
+            match crate::explain::explain_direct(cfg, &command, offline) {
+                Ok(mut exp) => {
+                    exp.lang = lang;
+                    let _ = send_event(
+                        &mut writer,
+                        &Event::Explanation {
+                            segments: exp.segments,
+                            source: exp.source,
+                        },
+                    );
+                }
+                Err(e) => {
+                    let _ = send_event(&mut writer, &Event::Error {
+                        kind: ErrorKind::Protocol,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
         Op::Clear => {
             match cache.clear() {
                 Ok(()) => { let _ = send_event(&mut writer, &Event::Ok); }
@@ -180,6 +206,7 @@ fn handle_connection(
                 intent,
                 max_candidates: max,
                 system_prompt: prompt::build_system_prompt(max),
+                want_explanation: false,
             };
             let result = if stream {
                 // 逐快照转发；客户端断连（写失败）→ 停止转发但不报错

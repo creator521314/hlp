@@ -103,7 +103,7 @@ fn ping(socket: &Path) -> bool {
         return false;
     };
     if s
-        .write_all(b"{\"v\":1,\"op\":\"ping\"}\n")
+        .write_all(b"{\"v\":2,\"op\":\"ping\"}\n")
         .and_then(|_| s.flush())
         .is_err()
     {

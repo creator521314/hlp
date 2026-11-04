@@ -23,6 +23,8 @@ pub struct GenerateRequest {
     pub max_candidates: usize,
     /// 系统提示词
     pub system_prompt: String,
+    /// v0.4：TUI 卡片需要逐段解释时置 true，扩展输出 schema（决策 8）
+    pub want_explanation: bool,
 }
 
 /// 一条候选命令。
@@ -37,6 +39,8 @@ pub struct GenerateResponse {
     /// 有序候选，第 0 个为 top1。契约保证非空（空结果由 Provider 转为
     /// `HlpError::NoCandidates`）。
     pub candidates: Vec<Candidate>,
+    /// v0.4：相对 top1 的逐段解释；解析失败/未请求时为空 vec
+    pub segments: Vec<crate::explain::Segment>,
 }
 
 /// LLM 后端抽象（REQUIREMENTS §6.3：插件化 Provider 接口）。
@@ -75,6 +79,7 @@ mod tests {
             intent: "把当前目录下所有超过100MB的文件列出来".to_string(),
             max_candidates: 3,
             system_prompt: "SYSTEM".to_string(),
+            want_explanation: false,
         };
         assert_eq!(req.intent, "把当前目录下所有超过100MB的文件列出来");
         assert_eq!(req.system_prompt, "SYSTEM");
@@ -96,6 +101,7 @@ mod tests {
                         Candidate { command: "top1".to_string() },
                         Candidate { command: "alt".to_string() },
                     ],
+                    segments: Vec::new(),
                 })
             }
         }
@@ -103,6 +109,7 @@ mod tests {
             intent: "x".to_string(),
             max_candidates: 3,
             system_prompt: String::new(),
+            want_explanation: false,
         };
         let mut seen: Vec<String> = Vec::new();
         let resp = SyncOnly

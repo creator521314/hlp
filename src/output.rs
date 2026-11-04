@@ -60,6 +60,9 @@ fn emit_inner(outcome: &EngineOutcome, args: &CliArgs, print_top1: bool) {
                 eprint!(" match={}", kind.as_str());
             }
         }
+        if let Some(score) = outcome.kb_score {
+            eprint!(" kb_score={score:.2}");
+        }
         eprintln!();
     }
 }

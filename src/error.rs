@@ -35,6 +35,10 @@ pub enum HlpError {
     /// daemon 拉起/协议失败（v0.3）。生成路径一律回退直连、不对外可见；
     /// 只有 `hlp daemon` 自身启动失败时才会浮出
     DaemonStart { reason: String },
+    /// kb-update 网络/zip/结构失败 → 退出码 6（v0.4）；事务回滚保留旧语料
+    KbUnavailable { reason: String },
+    /// `--tui` 于非 TTY → 退出码 6（v0.4）
+    TuiUnavailable { reason: String },
 }
 
 impl HlpError {
@@ -52,6 +56,8 @@ impl HlpError {
             HlpError::CacheUnavailable { .. } => 6,
             // daemon 属"本地服务不可达"语义，与 LLM 服务同段
             HlpError::DaemonStart { .. } => 4,
+            // v0.4：知识库显式更新失败、TUI 非 TTY 都属"本地能力不可用"
+            HlpError::KbUnavailable { .. } | HlpError::TuiUnavailable { .. } => 6,
         }
     }
 
@@ -73,6 +79,10 @@ impl HlpError {
             HlpError::CacheUnavailable { .. } => {
                 Some("缓存不影响翻译主流程；可检查数据目录权限，或 hlp --clear 清空后重试")
             }
+            HlpError::KbUnavailable { .. } => {
+                Some("可配置 [kb] index_url 走镜像/代理，或手动下载 tldr.zip 后重试")
+            }
+            HlpError::TuiUnavailable { .. } => Some("请在真终端运行，或改用 hlp --one-line \"意图\""),
             _ => None,
         }
     }
@@ -118,6 +128,12 @@ impl fmt::Display for HlpError {
             }
             HlpError::DaemonStart { reason } => {
                 write!(f, "daemon 拉起失败：{reason}")
+            }
+            HlpError::KbUnavailable { reason } => {
+                write!(f, "知识库不可用：{reason}")
+            }
+            HlpError::TuiUnavailable { reason } => {
+                write!(f, "TUI 不可用：{reason}")
             }
         }
     }

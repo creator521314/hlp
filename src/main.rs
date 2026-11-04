@@ -3,19 +3,27 @@
 //! v0.1 引擎：命令行参数 → Provider(ollama) → stdout 单行命令（--one-line）。
 //! v0.2 纯本地路径：`--check`（危险检测）、`--trust`（写信任表）、`init <shell>`。
 //! v0.3：daemon-first 生成（`--stream` 流式）+ 历史缓存（`--clear` / `cache-learn`）。
-//! 设计文档：docs/design/v0.1-engine.md、v0.2-shell-integration.md、v0.3-daemon-cache.md。
+//! v0.4：tldr 知识库（第 2 层）、`-x` 解释模式、`--dry-run`、TUI 卡片。
+//! 设计文档：docs/design/v0.1-engine.md、v0.2-shell-integration.md、
+//! v0.3-daemon-cache.md、v0.4-tui-knowledge.md。
 
 mod cache;
 mod cli;
 mod config;
 mod danger;
 mod daemon;
+mod dryrun;
 mod engine;
 mod error;
+mod explain;
 mod integrations;
+mod kb;
 mod output;
 mod prompt;
 mod provider;
+mod tui;
+
+use std::time::Instant;
 
 use cli::{CliArgs, Invocation};
 use engine::Engine;
@@ -36,6 +44,16 @@ fn main() {
             source,
         } => cache_learn(&intent, &command, cwd.as_deref(), &source),
         Invocation::Daemon => daemon_mode(),
+        Invocation::Explain {
+            command,
+            offline,
+            json,
+            verbose,
+        } => explain_mode(&command, offline, json, verbose),
+        Invocation::DryRun(command) => dry_run(&command),
+        Invocation::Tui(intent) => tui_mode(intent),
+        Invocation::KbUpdate => kb_update(),
+        Invocation::KbStatus => kb_status(),
     }
 }
 
@@ -119,6 +137,74 @@ fn cache_learn(intent: &str, command: &str, cwd: Option<&std::path::Path>, sourc
         c.learn_strict(intent, command, source, &cwd)
             .unwrap_or_else(|e| fail(e));
     }
+}
+
+/// `hlp -x`（v0.4 §3.3）：面向终端的阅读型输出，首个带散文的 stdout 模式。
+/// `--json` 输出机器可消费的 Explanation；失败语义见 explain 模块。
+fn explain_mode(command: &str, offline: bool, json: bool, verbose: bool) {
+    let cfg = config::load().unwrap_or_else(|e| fail(e));
+    let start = Instant::now();
+    let exp = explain::explain(&cfg, command, offline).unwrap_or_else(|e| fail(e));
+    if json {
+        let text = serde_json::to_string(&exp).unwrap_or_else(|e| fail(HlpError::DaemonStart {
+            reason: format!("解释结果序列化失败：{e}"),
+        }));
+        write_stdout(&format!("{text}\n"));
+    } else {
+        write_stdout(&explain::render(command, &exp));
+    }
+    if verbose {
+        eprintln!(
+            "source={} lang={} elapsed={}ms",
+            exp.source.as_str(),
+            exp.lang.as_str(),
+            start.elapsed().as_millis()
+        );
+    }
+}
+
+/// `hlp --dry-run`（v0.4 §3.4）：Unsupported 时 stdout 空、stderr 一行原因、退出 0。
+fn dry_run(command: &str) {
+    let plan = dryrun::plan(command);
+    match plan {
+        dryrun::DryPlan::Unsupported { reason } => {
+            eprintln!("hlp: 不支持 dry-run：{reason}");
+        }
+        _ => {
+            let text = dryrun::run(&plan).unwrap_or_else(|e| fail(e));
+            write_stdout(&text);
+        }
+    }
+}
+
+/// `hlp --tui [意图]`：非 TTY → TuiUnavailable（退出码 6）。
+fn tui_mode(intent: Option<String>) {
+    let cfg = config::load().unwrap_or_else(|e| fail(e));
+    tui::run(cfg, intent).unwrap_or_else(|e| fail(e));
+}
+
+/// `hlp kb-update`：显式联网，事务重建语料；失败退出 6，进度/统计走 stderr。
+fn kb_update() {
+    let cfg = config::load().unwrap_or_else(|e| fail(e));
+    kb::fetch::update_from(&cache::db_path(), &cfg.kb.index_url, &mut |msg| {
+        eprintln!("{msg}");
+    })
+    .unwrap_or_else(|e| fail(e));
+}
+
+/// `hlp kb-status`：key=value 协议，未建库时 pages=0 examples=0 updated_at=
+fn kb_status() {
+    let cfg = config::load().unwrap_or_else(|e| fail(e));
+    let kb = kb::Kb::from_config(&cfg).unwrap_or_else(|e| fail(e));
+    let s = kb.status();
+    write_stdout(&format!(
+        "pages={} examples={} updated_at={}\n",
+        s.pages,
+        s.examples,
+        s.updated_at
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    ));
 }
 
 /// `hlp daemon`（内部子命令）：主循环。已有存活实例 → 让位退出 0（非错误）。

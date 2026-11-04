@@ -257,7 +257,7 @@ bind \cg hlp-replace
 | **v0.1** | 引擎：参数 → Provider(ollama) → stdout 单行命令（`--one-line`）；Provider trait 定义 | `hlp --one-line "列出大文件"` 输出可用命令；stdout 纯净无装饰 | ✅ 已完成（设计 docs/design/v0.1-engine.md；测试 T-U-01~10、T-I-02~08 全绿，T-I-01 真机验收 `cargo test -- --ignored`） |
 | **v0.2** | **zsh / bash / fish 三种 shell 集成** + `//` 前缀 + Ctrl+G 替换；危险命令检测 + 可记忆信任 | 三种 shell 各自完成一次完整替换流程 | ✅ 已实现（设计 docs/design/v0.2-shell-integration.md；测试 T-U-21~32、T-I-11~18 全绿；三份集成脚本与设计文档 §3.3 字节级一致；bash 真机端到端已验证 M-2/M-4/M-6~M-9，zsh/fish 的 M-1/M-3 待在对应终端做一次人工验收） |
 | **v0.3** | daemon（按需拉起 + 空闲 5 分钟超时退出）+ unix socket + 流式替换；历史缓存（默认开 + `--clear` + 目录豁免） | 缓存命中亚秒返回；daemon 闲置自动退出 | ✅ 已实现（设计 docs/design/v0.3-daemon-cache.md；测试 T-U-40~50、T-I-20~31 全绿（daemon 集成 15 例含并发单实例、流式快照、断连自愈、豁免目录），v0.1 的 9 例经 daemon-first 路径回归通过；bash 真机端到端验证 M-10/M-11/M-12 语义：流式替换、学习回流后缓存命中 6ms 零 LLM 请求、--clear 回退、exempt_dirs 生效；zsh/fish 模板逻辑由单元测试覆盖，待对应终端人工验收） |
-| **v0.4** | tldr 知识库（第 2 层）；`hlp -x` 解释模式（语言跟随意图）；Dry-run；TUI 卡片（top1 + 可展开候选） | 全部三层打通 |
+| **v0.4** | tldr 知识库（第 2 层）；`hlp -x` 解释模式（语言跟随意图）；Dry-run；TUI 卡片（top1 + 可展开候选） | 全部三层打通 | ✅ 已实现（设计 docs/design/v0.4-tui-knowledge.md；测试 T-U-51~67、T-I-32~43 全绿，v0.1~v0.3 全部回归通过，共 151 例 + `cargo clippy --all-targets -- -D warnings` 零警告；三层链：kb 命中零 LLM 请求且进程启动+命中 <200ms（T-I-33/41/43）、无关意图落 LLM（T-I-34）、`kb-update` 事务重建与幂等（T-I-32）、`-x` LLM/本地双路径与 v1 daemon 回退（T-I-35~37）、dry-run 不执行原命令（T-I-38/39）、TUI 非 TTY 退出 6（T-I-40）、shell 模板不回归（T-I-42）；M-17/M-18 已用官方 tldr.zip（20.33MB，经代理下载）实测：导入 8023 页/35116 条示例、跳过 0，kb-status 计数一致，中文意图命中 source=kb 且 `{{占位符}}` 原样输出，`-x --offline` 用真实 pages.zh 语料给出逐段标注；真实库下 release `--one-line` kb 命中 55~58ms（<50ms 量级），debug 约 310ms；kb 批量打分做了等价重构（复用意图集合、去掉逐行 kb_pages 子查询），T-U-57 基准守门评分不变。M-15/16（TUI 交互、OSC52 复制）仍需在真终端人工验收一次） |
 | 远期 | 语音输入（whisper.cpp）、配置管理子命令 | — |
 
 ## 11. 竞品分析与差异化
@@ -295,6 +295,13 @@ bind \cg hlp-replace
 
 ## 14. 开放问题
 
-- [ ] 缓存的意图匹配策略：精确 / 模糊 / 前缀，阈值如何定
-- [ ] tldr 卡片如何与 LLM 输出融合排序（置信度评分）
-- [ ] Provider trait 的候选数量上限与超时策略
+- [x] 缓存的意图匹配策略：精确 / 模糊 / 前缀，阈值如何定 —— **v0.3 已解答**：
+  归一化后精确匹配优先、不足 4 字符不参与的最长前缀匹配；模糊/语义匹配延后
+  （设计 v0.3-daemon-cache.md §14 解答、v0.4 决策 3 复核）
+- [x] tldr 卡片如何与 LLM 输出融合排序（置信度评分）—— **v0.4 已解答（决策 3）**：
+  不混排打分；kb 达 `min_score` 阈值即整体优先（`--one-line` 短路返回，TUI 中
+  `[知识库]` 组排在 `[LLM]` 组前）。理由是两类候选置信度量纲不同
+  （人工编写 vs 模型波动），混排需标定实验，超出 v0.4 预算
+- [x] Provider trait 的候选数量上限与超时策略 —— **v0.1 已解答**：
+  `max_candidates` 1~10（提示词 + 生成截断共同保证）、`timeout_ms` 默认 60000
+  覆盖模型冷加载；v0.4 的 `want_explanation` 扩展不改 trait 签名

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Command};
@@ -43,6 +44,21 @@ pub enum Invocation {
     },
     /// daemon 主循环（内部子命令，一般由按需拉起触发）
     Daemon,
+    /// v0.4：解释模式（`hlp -x "<命令>"`）
+    Explain {
+        command: String,
+        offline: bool,
+        json: bool,
+        verbose: bool,
+    },
+    /// v0.4：本地 dry-run 预览（不执行原命令）
+    DryRun(String),
+    /// v0.4：TUI 卡片；None = 首屏输入框
+    Tui(Option<String>),
+    /// v0.4：显式联网更新 tldr 语料
+    KbUpdate,
+    /// v0.4：打印语料状态（key=value）
+    KbStatus,
 }
 
 fn build_command() -> Command {
@@ -62,6 +78,14 @@ fn build_command() -> Command {
                         .required(true)
                         .value_parser(["zsh", "bash", "fish"]),
                 ),
+        )
+        .subcommand(
+            Command::new("kb-update")
+                .about("下载并重建 tldr 知识库语料（显式联网）"),
+        )
+        .subcommand(
+            Command::new("kb-status")
+                .about("打印知识库状态：pages/examples/updated_at"),
         )
         .subcommand(
             Command::new("daemon")
@@ -108,7 +132,9 @@ fn build_command() -> Command {
                 .help("自然语言意图（多词自动以空格拼接）")
                 .num_args(1..)
                 .trailing_var_arg(true)
-                .required_unless_present_any(["check", "trust", "clear"]),
+                .required_unless_present_any([
+                    "check", "trust", "clear", "explain", "dry-run", "tui",
+                ]),
         )
         .arg(
             Arg::new("one-line")
@@ -166,6 +192,55 @@ fn build_command() -> Command {
                 .requires("trust")
                 .help("配合 --trust：触发时的样例命令，供人工审查"),
         )
+        // ── v0.4：解释模式 / dry-run / TUI（设计 §2.10）──
+        .arg(
+            Arg::new("explain")
+                .short('x')
+                .long("explain")
+                .value_name("COMMAND")
+                .num_args(1)
+                .conflicts_with_all([
+                    "one-line", "alt", "stream", "check", "trust", "clear",
+                    "dry-run", "tui",
+                ])
+                .help("解释模式：按 | 拆段逐个解释命令（默认经 daemon v2，失败回退直连）"),
+        )
+        .arg(
+            Arg::new("offline")
+                .long("offline")
+                .requires("explain")
+                .action(ArgAction::SetTrue)
+                .help("配合 -x：只用本地知识库标注，不调用 LLM"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .requires("explain")
+                .action(ArgAction::SetTrue)
+                .help("配合 -x：把解释结果以 JSON 输出（供机器消费/调试）"),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .value_name("COMMAND")
+                .num_args(1)
+                .conflicts_with_all([
+                    "one-line", "alt", "stream", "check", "trust", "clear",
+                    "explain", "tui",
+                ])
+                .help("只读预览：把命令变换成安全的等效预览并执行（绝不执行原命令）"),
+        )
+        .arg(
+            Arg::new("tui")
+                .long("tui")
+                .num_args(0..=1)
+                .value_name("INTENT")
+                .conflicts_with_all([
+                    "one-line", "alt", "stream", "check", "trust", "clear",
+                    "explain", "dry-run",
+                ])
+                .help("进入 TUI 卡片；可跟一个可选意图（缺省时首屏为输入框）"),
+        )
 }
 
 /// 解析进程参数。用法错误返回 clap::Error，由调用方 `e.exit()` 统一处理
@@ -182,6 +257,8 @@ pub fn parse() -> Result<Invocation, clap::Error> {
                 return Ok(Invocation::Init(shell));
             }
             "daemon" => return Ok(Invocation::Daemon),
+            "kb-update" => return Ok(Invocation::KbUpdate),
+            "kb-status" => return Ok(Invocation::KbStatus),
             "cache-learn" => {
                 return Ok(Invocation::CacheLearn {
                     intent: sub.get_one::<String>("intent").expect("required").clone(),
@@ -227,10 +304,47 @@ pub fn parse() -> Result<Invocation, clap::Error> {
         });
     }
 
+    // ── v0.4 本地优先路径 ──
+    if let Some(command) = matches.get_one::<String>("explain") {
+        if !intent.is_empty() {
+            return Err(conflict(&mut cmd, "-x/--explain 不能与位置参数意图同时使用"));
+        }
+        return Ok(Invocation::Explain {
+            command: command.clone(),
+            offline: matches.get_flag("offline"),
+            json: matches.get_flag("json"),
+            verbose: matches.get_flag("verbose"),
+        });
+    }
+    if let Some(command) = matches.get_one::<String>("dry-run") {
+        if !intent.is_empty() {
+            return Err(conflict(&mut cmd, "--dry-run 不能与位置参数意图同时使用"));
+        }
+        return Ok(Invocation::DryRun(command.clone()));
+    }
+    if matches.contains_id("tui") {
+        // `--tui [意图]`：可选值 + 位置参数多词意图合并（trailing_var_arg 会吃掉首个词之后的部分）
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = matches.get_one::<String>("tui") {
+            parts.push(v.clone());
+        }
+        parts.extend(intent.iter().cloned());
+        let joined = parts.join(" ");
+        return Ok(Invocation::Tui(if joined.trim().is_empty() {
+            None
+        } else {
+            Some(joined)
+        }));
+    }
+
     if intent.is_empty() {
+        // 裸 hlp：TTY 下等价 --tui（决策 7）；非 TTY 保持 v0.1 的用法错误
+        if std::io::stdout().is_terminal() {
+            return Ok(Invocation::Tui(None));
+        }
         return Err(cmd.error(
             clap::error::ErrorKind::MissingRequiredArgument,
-            "缺少意图参数（或使用 --check / --trust / --clear / init）",
+            "缺少意图参数（或使用 -x / --dry-run / --tui / --check / --trust / --clear / init）",
         ));
     }
 

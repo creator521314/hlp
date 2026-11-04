@@ -31,8 +31,9 @@ impl OllamaProvider {
 
 /// 透传给 ollama `format` 字段的 JSON Schema（设计文档 §3.2）。
 /// maxItems 固定 10；实际候选上限由提示词与 generate 截断共同保证。
-fn format_schema() -> Value {
-    json!({
+/// v0.4：want_explanation 时扩展 segments 输出（决策 8）。
+fn format_schema(want_explanation: bool) -> Value {
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "candidates": {
@@ -42,7 +43,72 @@ fn format_schema() -> Value {
             }
         },
         "required": ["candidates"]
-    })
+    });
+    if want_explanation {
+        schema["properties"]["segments"] = json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": { "cmd": {"type":"string"}, "note": {"type":"string"} },
+                "required": ["cmd", "note"]
+            }
+        });
+    }
+    schema
+}
+
+/// v0.4 解释模式的一次性 LLM 调用：返回 `message.content` 原文
+/// （不经 candidates 解析——解释输出的 schema 与生成不同）。
+pub fn raw_chat(cfg: &crate::config::Config, system: &str, user: &str) -> Result<String, HlpError> {
+    let o = &cfg.ollama;
+    let base_url = o.base_url.trim_end_matches('/').to_string();
+    let url = format!("{base_url}/api/chat");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_millis(o.timeout_ms))
+        .build();
+    let body = json!({
+        "model": o.model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        "stream": false,
+        "keep_alive": o.keep_alive,
+        "options": { "temperature": 0.2 },
+    });
+    let resp = agent
+        .post(&url)
+        .send_json(body)
+        .map_err(|e| map_ureq_err(e, &base_url))?;
+    let v: Value = resp.into_json().map_err(|e| HlpError::NoCandidates {
+        raw_excerpt: format!("解释响应不是合法 JSON：{e}"),
+    })?;
+    v.pointer("/message/content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| HlpError::NoCandidates {
+            raw_excerpt: "解释响应缺少 message.content 字段".to_string(),
+        })
+}
+
+/// 从生成响应 content 里解析可选的 segments（解析失败 → 空 vec，决策 8 双保险）。
+fn parse_segments_field(content: &str, want: bool) -> Vec<crate::explain::Segment> {
+    if !want {
+        return Vec::new();
+    }
+    let Ok(v) = serde_json::from_str::<Value>(content.trim()) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("segments").and_then(|s| s.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|x| crate::explain::Segment {
+            cmd: x.get("cmd").and_then(Value::as_str).unwrap_or("").to_string(),
+            note: x.get("note").and_then(Value::as_str).unwrap_or("").to_string(),
+        })
+        .collect()
 }
 
 impl Provider for OllamaProvider {
@@ -60,7 +126,7 @@ impl Provider for OllamaProvider {
                 { "role": "user", "content": req.intent },
             ],
             "stream": false,
-            "format": format_schema(),
+            "format": format_schema(req.want_explanation),
             "keep_alive": self.cfg.keep_alive,
             "options": { "temperature": 0.2 },
         });
@@ -95,6 +161,7 @@ impl Provider for OllamaProvider {
         }
         Ok(GenerateResponse {
             candidates: commands.into_iter().map(|command| Candidate { command }).collect(),
+            segments: parse_segments_field(content, req.want_explanation),
         })
     }
 
@@ -116,7 +183,7 @@ impl Provider for OllamaProvider {
                 { "role": "user", "content": req.intent },
             ],
             "stream": true,
-            "format": format_schema(),
+            "format": format_schema(req.want_explanation),
             "keep_alive": self.cfg.keep_alive,
             "options": { "temperature": 0.2 },
         });
@@ -174,6 +241,7 @@ impl Provider for OllamaProvider {
         }
         Ok(GenerateResponse {
             candidates: commands.into_iter().map(|command| Candidate { command }).collect(),
+            segments: parse_segments_field(&accumulated, req.want_explanation),
         })
     }
 }
