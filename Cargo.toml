@@ -1,6 +1,6 @@
 [package]
 name = "hlp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "自然语言 → shell 命令翻译器：意图进，命令出，附逐段解释"
 license = "MIT"
@@ -19,6 +19,9 @@ toml = "0.8"
 dirs = "5"
 # 阻塞式 HTTP 客户端：不拖 tokio 运行时，保进程冷启动 < 20ms（设计决策 1）
 ureq = { version = "2", features = ["json"] }
+# 危险命令规则匹配：8 条规则含词边界/管道上下文/alternation，手写分词器复杂度与收益
+# 不成比例（v0.2 设计决策 1）；编译耗时 < 1ms，不伤 --check 的 10ms 预算
+regex = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

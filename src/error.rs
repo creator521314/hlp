@@ -18,6 +18,17 @@ pub enum HlpError {
     ProviderHttp { status: u16, body_excerpt: String },
     /// 服务正常但没能给出任何可用候选 → 退出码 5
     NoCandidates { raw_excerpt: String },
+    /// danger.toml 语法/字段/规则 ID 非法 → 退出码 3（v0.2）
+    DangerInvalid { path: PathBuf, reason: String },
+    /// danger.toml 读写失败（权限/磁盘）→ 退出码 3（v0.2）
+    DangerIo {
+        path: PathBuf,
+        /// "读取" / "写入"，决定错误文案
+        action: &'static str,
+        source: io::Error,
+    },
+    /// `--trust` 的 pattern-id 不在内置规则表中 → 退出码 12（v0.2）
+    UnknownPattern { id: String },
 }
 
 impl HlpError {
@@ -26,6 +37,11 @@ impl HlpError {
             HlpError::ConfigInvalid { .. } | HlpError::ConfigIo { .. } => 3,
             HlpError::ProviderUnreachable { .. } | HlpError::ProviderHttp { .. } => 4,
             HlpError::NoCandidates { .. } => 5,
+            // v0.2：danger.toml 的问题与 config.toml 同级——配置类错误一律 3
+            HlpError::DangerInvalid { .. } | HlpError::DangerIo { .. } => 3,
+            // v0.2 新开的"危险判定"段：10/11 由 --check 的 DangerLevel 决定，
+            // 12 留给 --trust 的参数错误
+            HlpError::UnknownPattern { .. } => 12,
         }
     }
 
@@ -41,6 +57,9 @@ impl HlpError {
             HlpError::NoCandidates { .. } => {
                 Some("可换个说法重试，或在 ~/.config/hlp/config.toml 中更换 model")
             }
+            HlpError::DangerInvalid { .. } => Some("请手动修复该文件后重试（删除它即恢复空信任表）"),
+            HlpError::DangerIo { .. } => Some("请检查该文件的权限与磁盘空间"),
+            HlpError::UnknownPattern { .. } => Some("--trust 只接受内置危险规则 ID（见上列合法 ID）"),
             _ => None,
         }
     }
@@ -63,6 +82,23 @@ impl fmt::Display for HlpError {
             }
             HlpError::NoCandidates { raw_excerpt } => {
                 write!(f, "未能生成可用命令（原始响应片段：{raw_excerpt}）")
+            }
+            HlpError::DangerInvalid { path, reason } => {
+                write!(f, "danger.toml 无效：{}：{reason}", path.display())
+            }
+            HlpError::DangerIo {
+                path,
+                action,
+                source,
+            } => {
+                write!(f, "无法{action} danger.toml {}：{source}", path.display())
+            }
+            HlpError::UnknownPattern { id } => {
+                write!(
+                    f,
+                    "未知的危险模式 ID：{id}（合法 ID：{}）",
+                    crate::danger::patterns::rule_ids().join(", ")
+                )
             }
         }
     }

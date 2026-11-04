@@ -255,7 +255,7 @@ bind \cg hlp-replace
 | 版本 | 内容 | 验收标准 | 状态 |
 |---|---|---|---|
 | **v0.1** | 引擎：参数 → Provider(ollama) → stdout 单行命令（`--one-line`）；Provider trait 定义 | `hlp --one-line "列出大文件"` 输出可用命令；stdout 纯净无装饰 | ✅ 已完成（设计 docs/design/v0.1-engine.md；测试 T-U-01~10、T-I-02~08 全绿，T-I-01 真机验收 `cargo test -- --ignored`） |
-| **v0.2** | **zsh / bash / fish 三种 shell 集成** + `//` 前缀 + Ctrl+G 替换；危险命令检测 + 可记忆信任 | 三种 shell 各自完成一次完整替换流程 |
+| **v0.2** | **zsh / bash / fish 三种 shell 集成** + `//` 前缀 + Ctrl+G 替换；危险命令检测 + 可记忆信任 | 三种 shell 各自完成一次完整替换流程 | ✅ 已实现（设计 docs/design/v0.2-shell-integration.md；测试 T-U-21~32、T-I-11~18 全绿；三份集成脚本与设计文档 §3.3 字节级一致；bash 真机端到端已验证 M-2/M-4/M-6~M-9，zsh/fish 的 M-1/M-3 待在对应终端做一次人工验收） |
 | **v0.3** | daemon（按需拉起 + 空闲 5 分钟超时退出）+ unix socket + 流式替换；历史缓存（默认开 + `--clear` + 目录豁免） | 缓存命中亚秒返回；daemon 闲置自动退出 |
 | **v0.4** | tldr 知识库（第 2 层）；`hlp -x` 解释模式（语言跟随意图）；Dry-run；TUI 卡片（top1 + 可展开候选） | 全部三层打通 |
 | 远期 | 语音输入（whisper.cpp）、配置管理子命令 | — |

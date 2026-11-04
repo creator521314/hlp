@@ -1,12 +1,14 @@
 use clap::{Arg, ArgAction, Command};
 
-/// 解析后的命令行参数（契约见 docs/design/v0.1-engine.md §2.1）。
+use crate::integrations::Shell;
+
+/// 生成模式（v0.1 契约）的参数。v0.2 的 `--one-line` / `--alt` / `--verbose`
+/// 语义完全不变（设计决策 3：stdout 纯净契约神圣不可侵犯）。
 pub struct CliArgs {
     /// 位置参数多词以空格拼接后的完整意图，原样保留、不做改写
     pub intent: String,
     /// --one-line：单行纯净输出。v0.1 中这是唯一输出形态，缺省即此行为；
-    /// 显式传 flag 是为了让 shell 集成侧语义明确。字段为 v0.2 shell 集成
-    /// 契约预留，暂未在 output 分支中读取。
+    /// 显式传 flag 是为了让 shell 集成侧语义明确。
     #[allow(dead_code)]
     pub one_line: bool,
     /// --alt：展开全部候选，每行一条到 stdout
@@ -15,16 +17,43 @@ pub struct CliArgs {
     pub verbose: bool,
 }
 
+/// 一次调用的顶层模式。v0.2 新增的三条路径全部**不经过 LLM**
+/// （设计 §2.5：不构造 Engine、不读 config.toml）。
+pub enum Invocation {
+    /// v0.1 主形态：意图 → Provider → stdout 命令
+    Generate(CliArgs),
+    /// 本地危险检测，`key=value` 协议 + 退出码 0/10/11
+    Check(String),
+    /// 写入 danger.toml 信任列表
+    Trust { pattern: String, example: String },
+    /// 输出 shell 集成脚本
+    Init(Shell),
+}
+
 fn build_command() -> Command {
     Command::new("hlp")
         .version(env!("CARGO_PKG_VERSION"))
         .about("自然语言 → shell 命令翻译器：意图进，命令出")
+        // init 是独立子命令：出现时位置参数（意图）不再必需
+        .subcommand_negates_reqs(true)
+        // 子命令与 flags 天然互斥（`hlp init zsh --verbose` → 用法错误）
+        .args_conflicts_with_subcommands(true)
+        .subcommand(
+            Command::new("init")
+                .about("输出指定 shell 的集成脚本：eval \"$(hlp init zsh)\"")
+                .arg(
+                    Arg::new("shell")
+                        .help("目标 shell（zsh / bash / fish）")
+                        .required(true)
+                        .value_parser(["zsh", "bash", "fish"]),
+                ),
+        )
         .arg(
             Arg::new("intent")
                 .help("自然语言意图（多词自动以空格拼接）")
                 .num_args(1..)
                 .trailing_var_arg(true)
-                .required(true),
+                .required_unless_present_any(["check", "trust"]),
         )
         .arg(
             Arg::new("one-line")
@@ -44,21 +73,91 @@ fn build_command() -> Command {
                 .help("元信息（provider/模型/候选数/耗时）输出到 stderr")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("check")
+                .long("check")
+                .value_name("COMMAND")
+                .num_args(1)
+                .conflicts_with_all(["one-line", "alt", "verbose"])
+                .help("本地危险检测（不走 LLM）：stdout 输出 key=value，退出码 0/10/11"),
+        )
+        .arg(
+            Arg::new("trust")
+                .long("trust")
+                .value_name("PATTERN_ID")
+                .num_args(1)
+                .conflicts_with_all(["one-line", "alt", "verbose", "check"])
+                .help("把危险模式 ID 写入 danger.toml 信任列表（以后不再提示）"),
+        )
+        .arg(
+            Arg::new("example")
+                .long("example")
+                .value_name("COMMAND")
+                .num_args(1)
+                .requires("trust")
+                .help("配合 --trust：触发时的样例命令，供人工审查"),
+        )
 }
 
 /// 解析进程参数。用法错误返回 clap::Error，由调用方 `e.exit()` 统一处理
 /// （clap 打印用法说明到 stderr，退出码 2）。
-pub fn parse() -> Result<CliArgs, clap::Error> {
-    let matches = build_command().try_get_matches_from(std::env::args_os())?;
+pub fn parse() -> Result<Invocation, clap::Error> {
+    let mut cmd = build_command();
+    let matches = cmd.clone().try_get_matches_from(std::env::args_os())?;
+
+    if let Some(("init", sub)) = matches.subcommand() {
+        let name = sub.get_one::<String>("shell").expect("shell 为必填参数");
+        let shell = Shell::from_arg(name).expect("value_parser 已限定取值");
+        return Ok(Invocation::Init(shell));
+    }
+
     let intent: Vec<String> = matches
         .get_many::<String>("intent")
-        .expect("intent 为必填位置参数")
-        .cloned()
-        .collect();
-    Ok(CliArgs {
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+
+    if let Some(command) = matches.get_one::<String>("check") {
+        if !intent.is_empty() {
+            return Err(conflict(
+                &mut cmd,
+                "--check 不能与位置参数意图同时使用",
+            ));
+        }
+        return Ok(Invocation::Check(command.clone()));
+    }
+
+    if let Some(pattern) = matches.get_one::<String>("trust") {
+        if !intent.is_empty() {
+            return Err(conflict(
+                &mut cmd,
+                "--trust 不能与位置参数意图同时使用",
+            ));
+        }
+        let example = matches
+            .get_one::<String>("example")
+            .cloned()
+            .unwrap_or_default();
+        return Ok(Invocation::Trust {
+            pattern: pattern.clone(),
+            example,
+        });
+    }
+
+    if intent.is_empty() {
+        return Err(cmd.error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "缺少意图参数（或使用 --check / --trust / init）",
+        ));
+    }
+
+    Ok(Invocation::Generate(CliArgs {
         intent: intent.join(" "),
         one_line: matches.get_flag("one-line"),
         alt: matches.get_flag("alt"),
         verbose: matches.get_flag("verbose"),
-    })
+    }))
+}
+
+fn conflict(cmd: &mut Command, message: &str) -> clap::Error {
+    cmd.error(clap::error::ErrorKind::ArgumentConflict, message)
 }
