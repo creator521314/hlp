@@ -1,6 +1,6 @@
 [package]
 name = "hlp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "自然语言 → shell 命令翻译器：意图进，命令出，附逐段解释"
 license = "MIT"
@@ -22,6 +22,10 @@ ureq = { version = "2", features = ["json"] }
 # 危险命令规则匹配：8 条规则含词边界/管道上下文/alternation，手写分词器复杂度与收益
 # 不成比例（v0.2 设计决策 1）；编译耗时 < 1ms，不伤 --check 的 10ms 预算
 regex = "1"
+# 缓存 DB：bundled 静态编译 SQLite，避免目标机缺 libsqlite3 / 版本漂移（v0.3 决策 9）
+rusqlite = { version = "0.31", features = ["bundled"] }
+# daemon 拉起互斥：flock 防并发双拉起（v0.3 §2.3）；std 无 flock，不为此引 nix
+fs2 = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2"

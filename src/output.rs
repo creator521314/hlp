@@ -11,6 +11,21 @@ use crate::engine::EngineOutcome;
 /// - 备选数量提示、--verbose 元信息、一切错误信息走 stderr。
 /// - 任何模块禁止绕过本模块直接向 stdout 写入。
 pub fn emit(outcome: &EngineOutcome, args: &CliArgs) {
+    emit_inner(outcome, args, true);
+}
+
+/// v0.3 `--stream` 的收尾：快照行已由 main 逐行写出（每行一个全量快照），
+/// 这里只在"最终 top1 与最后快照不同"时补一行 top1，保证**最后一行 = 最终 top1**
+/// （§3.3：缓存命中时恰好一行）。stderr 协议与 emit 一致。
+pub fn emit_stream(outcome: &EngineOutcome, args: &CliArgs, last_snapshot: Option<&str>) {
+    let print_top = match last_snapshot {
+        Some(s) => s != outcome.top1,
+        None => true,
+    };
+    emit_inner(outcome, args, print_top);
+}
+
+fn emit_inner(outcome: &EngineOutcome, args: &CliArgs, print_top1: bool) {
     if args.alt {
         let mut buf = String::new();
         buf.push_str(&outcome.top1);
@@ -21,7 +36,9 @@ pub fn emit(outcome: &EngineOutcome, args: &CliArgs) {
         }
         print_pure(&buf);
     } else {
-        print_pure(&format!("{}\n", outcome.top1));
+        if print_top1 {
+            print_pure(&format!("{}\n", outcome.top1));
+        }
         if !outcome.alternatives.is_empty() {
             eprintln!(
                 "还有 {} 个备选（hlp --alt 查看）",
@@ -30,13 +47,20 @@ pub fn emit(outcome: &EngineOutcome, args: &CliArgs) {
         }
     }
     if args.verbose {
-        eprintln!(
-            "provider={} model={} candidates={} elapsed={}ms",
+        eprint!(
+            "provider={} model={} candidates={} elapsed={}ms source={}",
             outcome.provider_name,
             outcome.model,
-            outcome.alternatives.len() + 1,
-            outcome.elapsed.as_millis()
+            outcome.alternatives.len() + usize::from(print_top1),
+            outcome.elapsed.as_millis(),
+            outcome.source.as_str(),
         );
+        if outcome.source == crate::daemon::protocol::Source::Cache {
+            if let Some(kind) = outcome.match_kind {
+                eprint!(" match={}", kind.as_str());
+            }
+        }
+        eprintln!();
     }
 }
 

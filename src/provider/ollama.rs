@@ -97,6 +97,85 @@ impl Provider for OllamaProvider {
             candidates: commands.into_iter().map(|command| Candidate { command }).collect(),
         })
     }
+
+    /// v0.3 流式：`stream: true`，NDJSON 按行读，逐 chunk 增量提取
+    /// candidates[0] 的部分值作为全量快照回调（§2.8 / §4.3）。
+    fn generate_stream(
+        &self,
+        req: &GenerateRequest,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<GenerateResponse, HlpError> {
+        use std::io::{BufRead, BufReader};
+
+        let base_url = self.cfg.base_url.trim_end_matches('/').to_string();
+        let url = format!("{base_url}/api/chat");
+        let body = json!({
+            "model": self.cfg.model,
+            "messages": [
+                { "role": "system", "content": req.system_prompt },
+                { "role": "user", "content": req.intent },
+            ],
+            "stream": true,
+            "format": format_schema(),
+            "keep_alive": self.cfg.keep_alive,
+            "options": { "temperature": 0.2 },
+        });
+
+        let resp = self
+            .agent
+            .post(&url)
+            .send_json(body)
+            .map_err(|e| map_ureq_err(e, &base_url))?;
+
+        // 整体超时沿用 cfg.timeout_ms（默认 60s 覆盖模型冷加载）
+        let reader = BufReader::new(resp.into_reader());
+        let mut accumulated = String::new();
+        let mut last_snapshot = String::new();
+        for line in reader.lines() {
+            // 流中途断连 → ProviderUnreachable（设计 §2.8：已发快照由调用方处置）
+            let line = line.map_err(|e| HlpError::ProviderUnreachable {
+                base_url: base_url.clone(),
+                reason: format!("流式中断：{e}"),
+            })?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue; // 单行非 JSON（如 ollama 日志）跳过
+            };
+            if let Some(c) = v.pointer("/message/content").and_then(Value::as_str) {
+                accumulated.push_str(c);
+            }
+            // 增量提取 + v0.1 清洗 → 快照（变化且非空才回调）
+            if let Some(snapshot) = try_extract_first_candidate(&accumulated)
+                .as_deref()
+                .and_then(clean_command)
+            {
+                if snapshot != last_snapshot && !snapshot.is_empty() {
+                    last_snapshot = snapshot.clone();
+                    on_chunk(&snapshot);
+                }
+            }
+            if v.get("done").and_then(Value::as_bool).unwrap_or(false) {
+                break;
+            }
+        }
+
+        // done 后用 v0.1 两级解析产最终候选集（与最后一个快照无关，§4.3）
+        let commands: Vec<String> = extract_candidates(&accumulated)
+            .into_iter()
+            .take(req.max_candidates)
+            .collect();
+        if commands.is_empty() {
+            return Err(HlpError::NoCandidates {
+                raw_excerpt: excerpt_of(&accumulated),
+            });
+        }
+        Ok(GenerateResponse {
+            candidates: commands.into_iter().map(|command| Candidate { command }).collect(),
+        })
+    }
 }
 
 fn map_ureq_err(e: ureq::Error, base_url: &str) -> HlpError {
@@ -118,6 +197,45 @@ fn map_ureq_err(e: ureq::Error, base_url: &str) -> HlpError {
 /// 截断到 200 字符，用于错误信息中的原始响应片段。
 fn excerpt_of(s: &str) -> String {
     s.chars().take(200).collect()
+}
+
+/// 流式增量解析器（v0.3 设计 §4.3）：从**不完整**的累计 content 里提取
+/// `candidates[0]` 的当前部分值。
+///
+/// 定位链：`"candidates"` → 其后第一个 `[` → 其后第一个 `"` → 扫到第一个
+/// 未转义的 `"`。未找到闭合引号 → 返回已累积的部分串（末尾悬挂的 `\` 丢弃）；
+/// 定位失败（模型还没吐到数组）→ None。
+///
+/// 这是"快照"的原始来源：调用方还需经 `clean_command` 清洗后才是上屏快照。
+pub(crate) fn try_extract_first_candidate(acc: &str) -> Option<String> {
+    let key = acc.find("\"candidates\"")?;
+    let after = &acc[key + "\"candidates\"".len()..];
+    let bracket = after.find('[')?;
+    let rest = &after[bracket + 1..];
+    let open_quote = rest.find('"')?;
+
+    let mut out = String::new();
+    let mut chars = rest[open_quote + 1..].chars();
+    loop {
+        match chars.next() {
+            // 流恰好断在字符串中间 → 返回部分串（真前缀快照）
+            None => break,
+            Some('"') => return Some(out), // 未转义闭合引号 → 完整串
+            Some('\\') => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(c @ ('"' | '\\' | '/')) => out.push(c),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other); // 未知转义原样保留
+                }
+                None => break, // 悬挂反斜杠 → 丢弃，不透传（遗留风险 #1）
+            },
+            Some(c) => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 /// 两级解析（设计文档 §4.2）：
@@ -312,5 +430,62 @@ mod tests {
             clean_command("1. rm -rf /tmp/testdata").unwrap(),
             "rm -rf /tmp/testdata"
         );
+    }
+
+    /// T-U-48：分 chunk 喂部分 JSON，快照逐步逼近最终值
+    #[test]
+    fn tu48_incremental_snapshot_sequence() {
+        let chunks = [
+            r#"{"candidates": ["find . -ty"#,
+            r#"pe f -size +100M"]}"#,
+        ];
+        let mut acc = String::new();
+        let mut snapshots = Vec::new();
+        for c in chunks {
+            acc.push_str(c);
+            if let Some(s) = try_extract_first_candidate(&acc) {
+                snapshots.push(s);
+            }
+        }
+        assert_eq!(
+            snapshots,
+            vec!["find . -ty".to_string(), "find . -type f -size +100M".to_string()]
+        );
+    }
+
+    /// T-U-49：转义边界——`\"` 正确解码；悬挂 `\` 被丢弃
+    #[test]
+    fn tu49_incremental_escapes_and_dangling_backslash() {
+        // 完整串含转义引号
+        let acc = r#"{"candidates": ["echo \"hi\" | wc"]}"#;
+        assert_eq!(
+            try_extract_first_candidate(acc).unwrap(),
+            r#"echo "hi" | wc"#
+        );
+
+        // chunk 断在 `\"` 的反斜杠处：悬挂反斜杠丢弃，快照不带尾随 `\`
+        let partial = r#"{"candidates": ["echo \"hi\" | wc\"#;
+        assert_eq!(
+            try_extract_first_candidate(partial).unwrap(),
+            r#"echo "hi" | wc"#
+        );
+
+        // 单独一个悬挂反斜杠（字符串刚开头）
+        let partial = r#"{"candidates": ["\"#;
+        assert_eq!(try_extract_first_candidate(partial).unwrap(), "");
+
+        // `\n` 转义解码
+        let acc = r#"{"candidates": ["a\nb"]}"#;
+        assert_eq!(try_extract_first_candidate(acc).unwrap(), "a\nb");
+    }
+
+    /// 定位失败：模型还没吐到 candidates 数组 → None
+    #[test]
+    fn incremental_returns_none_before_array() {
+        assert!(try_extract_first_candidate(r#"{"cand"#).is_none());
+        assert!(try_extract_first_candidate(r#"{"candidates": ["#).is_none());
+        assert!(try_extract_first_candidate("").is_none());
+        // 不是候选格式的输出（兜底解析路径）→ 无快照
+        assert!(try_extract_first_candidate("1. find . -type f").is_none());
     }
 }

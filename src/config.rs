@@ -15,6 +15,12 @@ pub struct Config {
     pub provider: String,
     #[serde(default)]
     pub ollama: OllamaConfig,
+    /// 历史缓存（v0.3）
+    #[serde(default)]
+    pub cache: CacheConfig,
+    /// daemon（v0.3）
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 impl Default for Config {
@@ -22,6 +28,8 @@ impl Default for Config {
         Self {
             provider: default_provider(),
             ollama: OllamaConfig::default(),
+            cache: CacheConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
 }
@@ -50,6 +58,66 @@ impl Default for OllamaConfig {
             keep_alive: "5m".to_string(),
         }
     }
+}
+
+/// 历史缓存配置（v0.3 设计 §3.1）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CacheConfig {
+    /// 默认开启（REQUIREMENTS §8）
+    pub enabled: bool,
+    /// 目录豁免列表（词法前缀匹配；`~` 在读取时展开，见 v0.3 决策 10）
+    pub exempt_dirs: Vec<String>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            exempt_dirs: Vec::new(),
+        }
+    }
+}
+
+impl CacheConfig {
+    /// exempt_dirs 的绝对路径形态（`~`/`~/x` 已展开，空串被加载校验拒绝）。
+    pub fn exempt_paths(&self) -> Vec<PathBuf> {
+        self.exempt_dirs.iter().filter_map(|d| expand_tilde(d)).collect()
+    }
+}
+
+/// daemon 配置（v0.3 设计 §3.1）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DaemonConfig {
+    /// 空闲超时秒数；校验范围 10..=3600
+    pub idle_secs: u64,
+    /// 空 = 自动（$XDG_RUNTIME_DIR/hlp.sock 或 /tmp/hlp-{uid}.sock）
+    pub socket_path: String,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_secs: 300,
+            socket_path: String::new(),
+        }
+    }
+}
+
+/// 展开 `~` / `~/x` 前缀；其余原样返回；空串返回 None（由校验拒绝）。
+fn expand_tilde(p: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir();
+    if p == "~" {
+        return home;
+    }
+    if let Some(rest) = p.strip_prefix("~/") {
+        return home.map(|h| h.join(rest));
+    }
+    if p.trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(p))
 }
 
 impl Config {
@@ -87,6 +155,24 @@ impl Config {
         }
         if o.keep_alive.trim().is_empty() {
             return Err(invalid("ollama.keep_alive 不能为空".into()));
+        }
+        // ── v0.3：[daemon] / [cache] 校验（设计 §3.1）──
+        if !(10..=3600).contains(&self.daemon.idle_secs) {
+            return Err(invalid(format!(
+                "daemon.idle_secs 须在 10..=3600，当前值：{}",
+                self.daemon.idle_secs
+            )));
+        }
+        let socket = self.daemon.socket_path.trim();
+        if !socket.is_empty() && !socket.starts_with('/') {
+            return Err(invalid(format!(
+                "daemon.socket_path 须为绝对路径或留空，当前值：{socket}"
+            )));
+        }
+        for d in &self.cache.exempt_dirs {
+            if d.trim().is_empty() {
+                return Err(invalid("cache.exempt_dirs 含空串条目".into()));
+            }
         }
         Ok(())
     }

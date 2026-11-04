@@ -42,7 +42,7 @@ fn ti11_init_outputs_integration_scripts() {
         assert_eq!(out.status.code(), Some(0), "{shell} init 应退出 0");
         let text = stdout(&out);
         assert!(text.contains(binding), "{shell} 脚本应含 {binding}");
-        assert!(text.contains("hlp --one-line"), "{shell} 脚本应调用 --one-line");
+        assert!(text.contains("hlp --stream"), "{shell} 脚本应调用 --stream");
         assert!(text.contains("hlp --check"), "{shell} 脚本应调用 --check");
         assert!(stderr(&out).is_empty(), "{shell} init 不应写 stderr");
     }

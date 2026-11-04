@@ -29,6 +29,12 @@ pub enum HlpError {
     },
     /// `--trust` 的 pattern-id 不在内置规则表中 → 退出码 12（v0.2）
     UnknownPattern { id: String },
+    /// 缓存 DB 打开/读写失败 → 退出码 6（v0.3）。仅显式操作（--clear /
+    /// cache-learn）可见；生成路径一律静默降级
+    CacheUnavailable { path: PathBuf, reason: String },
+    /// daemon 拉起/协议失败（v0.3）。生成路径一律回退直连、不对外可见；
+    /// 只有 `hlp daemon` 自身启动失败时才会浮出
+    DaemonStart { reason: String },
 }
 
 impl HlpError {
@@ -42,6 +48,10 @@ impl HlpError {
             // v0.2 新开的"危险判定"段：10/11 由 --check 的 DangerLevel 决定，
             // 12 留给 --trust 的参数错误
             HlpError::UnknownPattern { .. } => 12,
+            // v0.3：缓存是加速器不是硬依赖，6 只在显式操作失败时出现
+            HlpError::CacheUnavailable { .. } => 6,
+            // daemon 属"本地服务不可达"语义，与 LLM 服务同段
+            HlpError::DaemonStart { .. } => 4,
         }
     }
 
@@ -60,6 +70,9 @@ impl HlpError {
             HlpError::DangerInvalid { .. } => Some("请手动修复该文件后重试（删除它即恢复空信任表）"),
             HlpError::DangerIo { .. } => Some("请检查该文件的权限与磁盘空间"),
             HlpError::UnknownPattern { .. } => Some("--trust 只接受内置危险规则 ID（见上列合法 ID）"),
+            HlpError::CacheUnavailable { .. } => {
+                Some("缓存不影响翻译主流程；可检查数据目录权限，或 hlp --clear 清空后重试")
+            }
             _ => None,
         }
     }
@@ -99,6 +112,12 @@ impl fmt::Display for HlpError {
                     "未知的危险模式 ID：{id}（合法 ID：{}）",
                     crate::danger::patterns::rule_ids().join(", ")
                 )
+            }
+            HlpError::CacheUnavailable { path, reason } => {
+                write!(f, "缓存不可用 {}：{reason}", path.display())
+            }
+            HlpError::DaemonStart { reason } => {
+                write!(f, "daemon 拉起失败：{reason}")
             }
         }
     }

@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use assert_cmd::Command;
@@ -18,7 +18,7 @@ fn spawn_ollama_mock(content: &str) -> String {
         "message": { "role": "assistant", "content": content }
     })
     .to_string();
-    let body = format!("{body}");
+    let body = body.to_string();
     thread::spawn(move || {
         // 服务若干次连接（Connection: close 使每请求一条连接）
         for stream in listener.incoming().take(16) {
@@ -74,26 +74,29 @@ fn handle_http(stream: &mut std::net::TcpStream, body: &str) -> std::io::Result<
     stream.flush()
 }
 
-/// 写入指向 mock 的 config.toml，返回 XDG_CONFIG_HOME 目录。
+/// v0.3 起 CLI 走 daemon-first：每个测试用独立的 XDG 三目录（config / data /
+/// cache）+ 独立 socket，互相不串；idle_secs=10 让拉起的 daemon 在测试后自清。
 fn write_config(base_url: &str) -> PathBuf {
-    let dir = tempfile::tempdir().expect("创建临时目录");
-    let cfg_dir = dir.path().join("hlp");
+    let root = tempfile::tempdir().expect("创建临时目录").keep();
+    let cfg_dir = root.join("config").join("hlp");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(
         cfg_dir.join("config.toml"),
         format!(
-            "provider = \"ollama\"\n\n[ollama]\nbase_url = \"{base_url}\"\nmodel = \"mock-model\"\ntimeout_ms = 5000\nmax_candidates = 3\n"
+            "provider = \"ollama\"\n\n[ollama]\nbase_url = \"{base_url}\"\nmodel = \"mock-model\"\ntimeout_ms = 5000\nmax_candidates = 3\n\n[daemon]\nidle_secs = 10\nsocket_path = \"{}\"\n",
+            root.join("daemon.sock").display()
         ),
     )
     .unwrap();
-    // keep()：拿到目录 PathBuf 且不删除（测试进程退出时由 OS 回收）
-    dir.keep()
+    root
 }
 
-/// 便捷封装：以指定 XDG_CONFIG_HOME 运行 hlp 二进制。
-fn hlp(xdg: &PathBuf) -> Command {
+/// 便捷封装：以隔离的 XDG 三目录运行 hlp 二进制。
+fn hlp(root: &Path) -> Command {
     let mut cmd = Command::cargo_bin("hlp").unwrap();
-    cmd.env("XDG_CONFIG_HOME", xdg);
+    cmd.env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"));
     cmd
 }
 

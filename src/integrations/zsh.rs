@@ -1,8 +1,13 @@
-//! zsh 集成脚本模板（设计 §3.3，逐字交付的协议——文案与 `hlp` 调用点不得改写）。
+//! zsh 集成脚本模板 v2（v0.3 §4.4）。
 //!
-//! 交互状态机见设计 §4.1：撤销 → 生成 → 危险检查 → 确认 → 替换。
+//! 相对 v0.2 的变化：
+//! - 生成走 `hlp --stream`：每行一个全量快照，buffer 逐行刷新（"命令正在打字"）；
+//! - 退出码经临时文件传递——`< <(...)` 的进程替换不向 `$?` 传值（遗留风险 #2）；
+//! - `add-zsh-hook preexec` 学习回流：执行了 hlp 生成/修正的命令 → cache-learn。
+//!
+//! 撤销 / 危险检查 / 信任机制与 v0.2 逐字一致。
 
-pub(crate) const SCRIPT: &str = r##"# hlp zsh 集成 —— 在 ~/.zshrc 加入：eval "$(hlp init zsh)"
+pub(crate) const SCRIPT: &str = r##"# hlp zsh 集成 v2（流式 + 学习回流）—— 在 ~/.zshrc 加入：eval "$(hlp init zsh)"
 hlp-replace() {
   # ── 撤销：当前 buffer 是上次生成结果 → 恢复原始意图 ──
   if [[ -n "$hlp_generated" && "$BUFFER" == "$hlp_generated" ]]; then
@@ -12,6 +17,7 @@ hlp-replace() {
     zle -M "已撤销，恢复意图原文"
     return
   fi
+  local intent_line="$BUFFER"
   local intent="${BUFFER#//}"
   intent="${intent#"${intent%%[![:space:]]*}"}"   # 去前导空白
   if [[ -z "$intent" ]]; then
@@ -20,33 +26,47 @@ hlp-replace() {
   fi
   zle -M "… hlp 生成中"
   zle reset-prompt
-  local cmd rc
-  cmd=$(hlp --one-line "$intent" 2>/dev/null); rc=$?
-  if [[ $rc -ne 0 || -z "$cmd" ]]; then
+  # ── 流式：每行一个全量快照，逐行刷 buffer ──
+  # 进程替换拿不到 hlp 的退出码 → 写入临时文件，EOF 前保证已写入
+  local last="" line rc_file rc
+  rc_file="$(mktemp "${TMPDIR:-/tmp}/hlp-rc.XXXXXX")"
+  while IFS= read -r line; do
+    last="$line"
+    BUFFER="$line"
+    CURSOR=${#BUFFER}
+    zle reset-prompt
+  done < <( { hlp --stream "$intent" 2>/dev/null; echo "$?" >| "$rc_file"; } )
+  rc="$(< "$rc_file")"
+  command rm -f "$rc_file"
+  if [[ -z "$last" ]]; then
+    BUFFER="$intent_line"
+    CURSOR=${#BUFFER}
     zle -M "✗ 生成失败（hlp 退出码 $rc）"
     return
   fi
   # ── 危险检查（本地，<10ms）──
   local level pattern
-  level=$(hlp --check "$cmd" 2>/dev/null | sed -n 's/^level=//p')
-  pattern=$(hlp --check "$cmd" 2>/dev/null | sed -n 's/^pattern=//p')
+  level=$(hlp --check "$last" 2>/dev/null | sed -n 's/^level=//p')
+  pattern=$(hlp --check "$last" 2>/dev/null | sed -n 's/^pattern=//p')
   if [[ "$level" == "fatal" ]]; then
     local reply
-    read "reply?⚠ 致命命令，需完整重新输入以确认: $cmd
+    read "reply?⚠ 致命命令，需完整重新输入以确认: $last
 确认输入: "
-    if [[ "$reply" != "$cmd" ]]; then
+    if [[ "$reply" != "$last" ]]; then
+      BUFFER="$intent_line"
+      CURSOR=${#BUFFER}
       zle -M "✗ 确认失败，已放弃（原始意图保留）"
       return
     fi
-    if hlp-confirm-trust "$pattern" "$cmd"; then :; fi
+    if hlp-confirm-trust "$pattern" "$last"; then :; fi
   elif [[ "$level" == "warning" ]]; then
     local reply
     read "reply?⚠ 警告（$pattern），回车采纳 / Ctrl+C 放弃: "
-    hlp-confirm-trust "$pattern" "$cmd"
+    hlp-confirm-trust "$pattern" "$last"
   fi
-  hlp_last_intent="$BUFFER"
-  hlp_generated="$cmd"
-  BUFFER="$cmd"
+  hlp_last_intent="$intent_line"
+  hlp_generated="$last"
+  BUFFER="$last"
   CURSOR=${#BUFFER}
   zle -M "✓ 已生成（再按 Ctrl+G 撤销，回车执行）"
 }
@@ -62,6 +82,22 @@ hlp-confirm-trust() {
   fi
 }
 
+# ── 学习回流：执行了 hlp 生成/修正的命令 → 写入历史缓存 ──
+hlp-preexec() {
+  [[ -z "$hlp_generated" ]] && return
+  local executed="$1"
+  local intent="${hlp_last_intent#//}"
+  if [[ "$executed" == "$hlp_generated" ]]; then
+    hlp cache-learn --intent "$intent" --command "$executed" --source adopted 2>/dev/null
+  else
+    hlp cache-learn --intent "$intent" --command "$executed" --source correction 2>/dev/null
+  fi
+  hlp_generated=""
+  hlp_last_intent=""
+}
+
 zle -N hlp-replace
 bindkey '^G' hlp-replace
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec hlp-preexec
 "##;

@@ -53,14 +53,14 @@ mod tests {
         assert_eq!(Shell::from_arg(""), None);
     }
 
-    /// 每份脚本都必须：绑定 Ctrl+G（^G）、调用 --one-line、调用 --check
+    /// 每份脚本都必须：绑定 Ctrl+G（^G）、流式生成、危险检查、信任、学习回流
     #[test]
     fn scripts_bind_ctrl_g_and_call_hlp() {
         for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
             let s = script(shell);
             assert!(!s.is_empty());
             assert!(s.ends_with('\n'), "{shell:?} 脚本应以换行结尾");
-            for needle in ["hlp --one-line", "hlp --check", "hlp --trust", "//"] {
+            for needle in ["hlp --stream", "hlp --check", "hlp --trust", "hlp cache-learn", "//"] {
                 assert!(s.contains(needle), "{shell:?} 脚本缺少 {needle}");
             }
         }
@@ -68,5 +68,17 @@ mod tests {
         assert!(script(Shell::Bash).contains("bind -x '\""), "bash 用 bind -x + \\C-g");
         assert!(script(Shell::Bash).contains(r"\C-g"));
         assert!(script(Shell::Fish).contains(r"bind \cg"));
+    }
+
+    /// v0.3 新增：三 shell 的 preexec 学习钩子（T-I-31 的单元级前置）
+    #[test]
+    fn scripts_have_preexec_hooks() {
+        assert!(script(Shell::Zsh).contains("add-zsh-hook preexec"));
+        assert!(script(Shell::Bash).contains("trap 'hlp-preexec' DEBUG"));
+        assert!(script(Shell::Fish).contains("--on-event fish_preexec"));
+        // 退出码传递：进程替换陷阱的规避手段
+        assert!(script(Shell::Zsh).contains("rc_file"), "zsh 用临时文件传退出码");
+        assert!(script(Shell::Bash).contains("rc_file"), "bash 用临时文件传退出码");
+        assert!(script(Shell::Fish).contains("pipestatus"), "fish 用 pipestatus");
     }
 }
